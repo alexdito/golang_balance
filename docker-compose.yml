@@ -1,0 +1,30 @@
+version: "3.7"
+
+services:
+  postgres:
+    container_name: postgres
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: golang
+      POSTGRES_PASSWORD: golang
+    ports:
+      - "5432:5432"
+    networks:
+      - backend
+
+  go:
+    container_name: go
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080" # Forward the exposed port 8080 on the container to port 8080 on the host machine
+    depends_on:
+      - "postgres"
+    volumes:
+      - ./app/:/application
+    networks:
+      - backend
+
+networks:
+  backend:
