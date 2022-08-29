@@ -10,6 +10,18 @@ type Balance struct {
 	Balance float64
 }
 
+func GetBalanceByUserId(id int64, db *gorm.DB) float64 {
+	balanceModel := Balance{UserId: id}
+
+	result := db.Where("user_id = ?", balanceModel.UserId).First(&balanceModel)
+
+	if result.Error != nil {
+		return 0
+	}
+
+	return balanceModel.Balance
+}
+
 func (b *Balance) GetBalance(db *gorm.DB) bool {
 	result := db.Where("user_id = ?", b.UserId).First(&b)
 
