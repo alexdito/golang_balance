@@ -3,64 +3,45 @@ package operations
 import (
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"testovoe/app"
 	"testovoe/model"
 )
 
 const (
-	GettingCurrentBalanceMessage    = "Получение текущего баланса пользователя."
-	InvalidUserIdMessage            = "Неверный идентификатор пользователя."
-	WriteOffCashMessage             = "Списания средств с баланса."
-	WrongWriteOffAmountMessage      = "Неверная сумма списания."
-	DeficiencyCashOnBalanceMessage  = "Недостаточно средств для списания."
-	TransactionListMessage          = "Недостаточно средств для списания."
-	TransactionListOperationMessage = "Получение списка транзакций."
-	//"Неверная сумма перевода."
-	//"Перевод средств."
-	//"Пользователя с таким ID не существует"
-	//"Недостаточно средств для перевода"
-
+	GettingCurrentBalanceMessage    = "Получение текущего баланса пользователя"
+	InvalidUserIdMessage            = "Неверный идентификатор пользователя"
+	WriteOffCashMessage             = "Списания средств с баланса"
+	AdditionalCashMessage           = "Пополнение баланса"
+	WrongTransactionAmountMessage   = "Неверная сумма транзакции"
+	TransactionListOperationMessage = "Получение списка транзакций"
+	TransferOperationMessage        = "Перевод средств"
+	TransferOperationToMessage      = "Перевод средств для %d"
+	TransferOperationFromMessage    = "Перевод средств от %d"
+	WrongOperationMessage           = "Неизвестная операция"
 )
 
+var operationDescription = map[string]string{
+	Additional: AdditionalCashMessage,
+	Withdrawal: WriteOffCashMessage,
+	Transfer:   TransferOperationMessage,
+}
+
 const (
-	Additional         = "additional"
-	Withdrawal         = "withdrawal"
-	Transfer           = "transfer"
-	AdditionalTransfer = "additional-transfer"
-	WithdrawalTransfer = "withdrawal-transfer"
+	Additional = "additional"
+	Withdrawal = "withdrawal"
+	Transfer   = "transfer"
 )
 
 func GetTransactions(c *gin.Context, app *app.App) (int, map[string]any) {
 	app.Mutex.Lock()
 	defer app.Mutex.Unlock()
 
-	userId, errUserId := strconv.ParseInt(c.PostForm("userId"), 0, 64)
-
-	if errUserId != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   InvalidUserIdMessage,
-			"operation": TransactionListOperationMessage,
-		}
-	}
-
-	limit, errLimit := strconv.ParseInt(c.PostForm("limit"), 0, 64)
-	if errLimit != nil {
-		limit = 2
-	}
-
-	offset, errOffset := strconv.ParseInt(c.PostForm("offset"), 0, 64)
-	if errOffset != nil {
-		offset = 2
-	}
-
-	order := c.PostForm("order")
-
-	transactions := model.Transactions{}
-	err := transactions.GetTransactionList(userId, int(limit), int(offset), order, app.DataBase)
-
-	fmt.Println(transactions)
+	userId, err := strconv.ParseInt(c.Query("userId"), 0, 64)
 
 	if err != nil {
 		return http.StatusBadRequest, gin.H{
@@ -69,8 +50,37 @@ func GetTransactions(c *gin.Context, app *app.App) (int, map[string]any) {
 		}
 	}
 
-	return http.StatusOK, gin.H{
-		"balance":   transactions.Transaction,
+	limit, err := strconv.ParseInt(c.Query("limit"), 0, 64)
+	if err != nil {
+		limit = 2
+	}
+
+	offset, err := strconv.ParseInt(c.Query("offset"), 0, 64)
+	if err != nil {
+		offset = 2
+	}
+
+	order := c.Query("order")
+
+	if order == "" || order == "created_at" || order == "amount" {
+		transactions := model.Transactions{}
+		err = transactions.GetTransactionList(userId, int(limit), int(offset), order, app.DataBase)
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   InvalidUserIdMessage,
+				"operation": TransactionListOperationMessage,
+			}
+		}
+
+		return http.StatusOK, gin.H{
+			"balance":   transactions.Transaction,
+			"operation": TransactionListOperationMessage,
+		}
+	}
+
+	return http.StatusBadRequest, gin.H{
+		"message":   "Неизвестное поле для сортировки",
 		"operation": TransactionListOperationMessage,
 	}
 }
@@ -88,198 +98,187 @@ func GetBalance(c *gin.Context, app *app.App) (int, map[string]any) {
 		}
 	}
 
+	balance, err := model.GetBalanceByUserId(userId, app.DataBase)
+
+	if err != nil {
+		return http.StatusBadRequest, gin.H{
+			"message":   InvalidUserIdMessage,
+			"operation": GettingCurrentBalanceMessage,
+		}
+	}
+
+	currency := strings.ToUpper(c.Query("currency"))
+
+	balance, currency = convertBalanceByCurrency(balance, currency)
+
 	return http.StatusOK, gin.H{
-		"balance":   model.GetBalanceByUserId(userId, app.DataBase),
+		"balance":   balance,
+		"currency":  currency,
 		"operation": GettingCurrentBalanceMessage,
 	}
 }
 
-func ChangeBalance(c *gin.Context, app *app.App, operation string) (int, map[string]any) {
+func convertBalanceByCurrency(balance float64, currency string) (float64, string) {
+	switch currency {
+	case "USD":
+		return math.Floor((balance/60.18)*100) / 100, currency
+	case "EUR":
+		return math.Floor((balance/60.33)*100) / 100, currency
+	case "CYN":
+		return math.Floor((balance/8.66)*100) / 100, currency
+	default:
+		return balance, "RUB"
+	}
+}
+
+func ExecuteTransaction(c *gin.Context, app *app.App, operation string) (int, map[string]any) {
 	app.Mutex.Lock()
 	defer app.Mutex.Unlock()
 
+	db := app.DataBase
+
+	description, isExists := operationDescription[operation]
+
+	if !isExists {
+		return http.StatusBadRequest, gin.H{
+			"message": WrongOperationMessage,
+		}
+	}
+
+	tx := db.Begin()
+
+	var httpStatus int
+	var response map[string]any
+	var err error
+
 	switch operation {
-	case Additional:
-		return additionalBalance(c, app)
-	case Withdrawal:
-		return withdrawalBalance(c, app)
 	case Transfer:
-		return transfer(c, app)
+		senderId, err := strconv.ParseInt(c.PostForm("sender"), 0, 64)
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   InvalidUserIdMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		recipientId, err := strconv.ParseInt(c.PostForm("recipient"), 0, 64)
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   InvalidUserIdMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		amount, err := strconv.ParseFloat(c.PostForm("amount"), 64)
+
+		if amount <= 0 {
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		httpStatus, response, err = addTransaction(senderId, amount, Withdrawal, fmt.Sprintf(TransferOperationToMessage, recipientId), tx)
+
+		if err != nil {
+			tx.Rollback()
+
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		httpStatus, response, err = addTransaction(recipientId, amount, Additional, fmt.Sprintf(TransferOperationFromMessage, senderId), tx)
+
+		if err != nil {
+			tx.Rollback()
+
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		httpStatus = http.StatusOK
+		response = gin.H{
+			"message":   fmt.Sprintf("Перевод средств от %d для %d успешно выполнен", senderId, recipientId),
+			"operation": TransferOperationMessage,
+		}
+	case Additional, Withdrawal:
+		userId, err := strconv.ParseInt(c.PostForm("userId"), 0, 64)
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   InvalidUserIdMessage,
+				"operation": description,
+			}
+		}
+
+		amount, err := strconv.ParseFloat(c.PostForm("amount"), 64)
+
+		if amount <= 0 {
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": TransferOperationMessage,
+			}
+		}
+
+		if err != nil {
+			return http.StatusBadRequest, gin.H{
+				"message":   WrongTransactionAmountMessage,
+				"operation": description,
+			}
+		}
+
+		httpStatus, response, err = addTransaction(userId, amount, operation, description, tx)
 	default:
 		return http.StatusBadRequest, gin.H{
-			"message": "Неизвестная операция",
+			"message": WrongOperationMessage,
 		}
 	}
+
+	if err != nil {
+		tx.Rollback()
+		return http.StatusBadRequest, gin.H{
+			"message":   err,
+			"operation": operation,
+		}
+	}
+
+	tx.Commit()
+
+	return httpStatus, response
 }
 
-func withdrawalBalance(c *gin.Context, app *app.App) (int, map[string]any) {
-	userId, errUserId := strconv.ParseInt(c.PostForm("userId"), 0, 64)
-
-	if errUserId != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   InvalidUserIdMessage,
-			"operation": WriteOffCashMessage,
-		}
-	}
-
-	amount, errAmount := strconv.ParseFloat(c.PostForm("amount"), 64)
-
-	if errAmount != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   WrongWriteOffAmountMessage,
-			"operation": WriteOffCashMessage,
-		}
-	}
-
-	balance := model.GetBalanceByUserId(userId, app.DataBase)
-
-	if balance-amount < 0 {
-		return http.StatusBadRequest, gin.H{
-			"message":   DeficiencyCashOnBalanceMessage,
-			"operation": WriteOffCashMessage,
-		}
-	}
-
+func addTransaction(userId int64, amount float64, operation string, description string, db *gorm.DB) (int, map[string]any, error) {
 	transaction := model.Transaction{
 		UserID:      userId,
 		Amount:      amount,
-		Operation:   Withdrawal,
-		Description: WriteOffCashMessage,
+		Operation:   operation,
+		Description: description,
 	}
 
-	newBalance, err := transaction.AddTransaction(app.DataBase)
+	balance, err := transaction.AddTransaction(db)
 
 	if err != nil {
 		return http.StatusBadRequest, gin.H{
 			"message":   err.Error(),
-			"operation": WriteOffCashMessage,
-		}
-	}
-
-	return http.StatusOK, gin.H{
-		"balance":   newBalance,
-		"operation": WriteOffCashMessage,
-	}
-}
-
-func transfer(c *gin.Context, app *app.App) (int, map[string]any) {
-	senderId, errSender := strconv.ParseInt(c.PostForm("sender"), 0, 64)
-
-	if errSender != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Неверный идентификатор отправителя.",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	recipientId, errRecipient := strconv.ParseInt(c.PostForm("recipient"), 0, 64)
-
-	if errRecipient != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Неверный идентификатор получателяю",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	amount, errAmount := strconv.ParseFloat(c.PostForm("amount"), 64)
-
-	if errAmount != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Неверная сумма перевода.",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	balanceSender := model.Balance{UserId: senderId}
-	result := balanceSender.GetBalance(app.DataBase)
-
-	if !result {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Пользователя с таким ID не существует",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	if balanceSender.Balance-amount < 0 {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Недостаточно средств для перевода",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	transactionSender := model.Transaction{
-		UserID:      senderId,
-		Amount:      amount,
-		Operation:   WithdrawalTransfer,
-		Description: fmt.Sprintf("Перевод средств для %d", recipientId),
-	}
-
-	transactionRecipient := model.Transaction{
-		UserID:      recipientId,
-		Amount:      amount,
-		Operation:   AdditionalTransfer,
-		Description: fmt.Sprintf("Перевод средств от %d", senderId),
-	}
-
-	_, errTransactionSender := transactionSender.AddTransaction(app.DataBase)
-
-	if errTransactionSender != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Ошибка при переводе средств",
-			"operation": "Перевод средств.",
-		}
-	}
-	_, errTransactionRecipient := transactionRecipient.AddTransaction(app.DataBase)
-
-	if errTransactionRecipient != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Ошибка при переводе средств",
-			"operation": "Перевод средств.",
-		}
-	}
-
-	return http.StatusOK, gin.H{
-		"operation": "Перевод средств.",
-	}
-}
-
-func additionalBalance(c *gin.Context, app *app.App) (int, map[string]any) {
-	userId, errUserId := strconv.ParseInt(c.PostForm("userId"), 0, 64)
-
-	if errUserId != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   InvalidUserIdMessage,
-			"operation": "Пополнение баланса.",
-		}
-	}
-
-	amount, errAmount := strconv.ParseFloat(c.PostForm("amount"), 64)
-
-	if errAmount != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   "Неверная сумма зачисления.",
-			"operation": "Пополнение баланса.",
-		}
-	}
-
-	transaction := model.Transaction{
-		UserID:      userId,
-		Amount:      amount,
-		Operation:   Additional,
-		Description: "Пополнение баланса.",
-	}
-
-	balance, err := transaction.AddTransaction(app.DataBase)
-
-	if err != nil {
-		return http.StatusBadRequest, gin.H{
-			"message":   err.Error(),
-			"operation": "Пополнение баланса.",
-		}
+			"operation": description,
+		}, err
 	}
 
 	return http.StatusOK, gin.H{
 		"balance":   balance,
-		"operation": "Пополнение баланса.",
-	}
+		"operation": description,
+	}, nil
 }

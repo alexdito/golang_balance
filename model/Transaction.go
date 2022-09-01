@@ -54,42 +54,47 @@ func (t *Transactions) GetTransactionList(userId int64, limit int, offset int, o
 }
 
 func (t *Transaction) AddTransaction(db *gorm.DB) (float64, error) {
-	tx := db.Begin()
-
-	result := tx.Create(&t)
-
-	if result.Error != nil {
-		tx.Rollback()
-		return 0, errors.New("ошибка при создании записи транзакции")
-	}
-
 	balance := Balance{UserId: t.UserID}
-	balanceResult := balance.GetBalance(tx)
 
-	if !balanceResult {
-		tx.Rollback()
-		return 0, errors.New("ошибка при получении баланса")
+	if !balance.GetBalance(db) {
+		return 0, errors.New("ошибка при создании баланса")
 	}
 
 	switch t.Operation {
-	case Withdrawal:
-		balance.Balance = balance.Balance - t.Amount
-	case WithdrawalTransfer:
-		balance.Balance = balance.Balance - t.Amount
 	case Additional:
-		balance.Balance = balance.Balance + t.Amount
-	case AdditionalTransfer:
-		balance.Balance = balance.Balance + t.Amount
+		balance.Balance += t.Amount
+	case Withdrawal:
+		balance.Balance -= t.Amount
+		if balance.Balance < 0 {
+			return 0, errors.New("сумма списания больше чем баласн")
+		}
+	default:
+		return 0, errors.New("неизвестная операция")
 	}
 
-	editBalance := balance.SetBalance(tx)
+	result := db.Create(&t)
+
+	if result.Error != nil {
+		return 0, result.Error
+	}
+
+	editBalance := balance.SetBalance(db)
 
 	if !editBalance {
-		tx.Rollback()
 		return 0, errors.New("ошибка при изменении баланса")
 	}
 
-	tx.Commit()
-
 	return balance.Balance, nil
+}
+
+func GetBalanceByUserId(id int64, db *gorm.DB) (float64, error) {
+	balanceModel := Balance{UserId: id}
+
+	result := db.Where("user_id = ?", balanceModel.UserId).First(&balanceModel)
+
+	if result.Error != nil {
+		return 0, errors.New("нет записи о балансе")
+	}
+
+	return balanceModel.Balance, nil
 }
