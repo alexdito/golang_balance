@@ -4,13 +4,11 @@ import (
 	"fmt"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"sync"
-	"testovoe/config"
+	"testovoe/pkg/config"
 )
 
 type App struct {
 	DataBase *gorm.DB
-	sync.Mutex
 }
 
 func GetApp() (*App, error) {
